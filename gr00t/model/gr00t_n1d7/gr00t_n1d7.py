@@ -168,6 +168,18 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.vl_self_attention.eval()
 
     def sample_time(self, batch_size, device, dtype):
+        """Sample the flow-matching noise level t, where t=0 is noise and t=1 is clean.
+
+        The default "beta" path is GR00T's own schedule: Beta(1.5, 1.0) concentrates
+        mass near 1, so (1 - sample) concentrates near 0 and the model sees mostly
+        high-noise inputs. The shortcut paper instead samples t uniformly; which is
+        better here is an open question, so it is a config switch rather than a
+        replacement. Both are scaled by noise_s to keep t away from a fully clean
+        sample.
+        """
+        if getattr(self.config, "shortcut_time_distribution", "beta") == "uniform":
+            sample = torch.rand(batch_size, device=device, dtype=dtype)
+            return sample * self.config.noise_s
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
         return sample

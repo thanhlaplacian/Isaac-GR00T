@@ -174,6 +174,15 @@ class Gr00tN1d7Config(PretrainedConfig):
         Only runs when the objective is enabled, so checkpoints predating these fields
         keep loading unchanged.
         """
+        # Checked unconditionally: shortcut_time_distribution changes the
+        # flow-matching noise schedule on its own, with or without the objective, so a
+        # typo here must not be silently read as "beta".
+        if self.shortcut_time_distribution not in ("beta", "uniform"):
+            raise ValueError(
+                f"shortcut_time_distribution must be 'beta' or 'uniform' (got "
+                f"{self.shortcut_time_distribution!r})."
+            )
+
         if not getattr(self, "shortcut_enabled", False):
             return
 
@@ -193,12 +202,6 @@ class Gr00tN1d7Config(PretrainedConfig):
             raise ValueError(
                 f"shortcut_loss_weight must be >= 0 (got {self.shortcut_loss_weight})."
             )
-        if self.shortcut_time_distribution not in ("beta", "uniform"):
-            raise ValueError(
-                f"shortcut_time_distribution must be 'beta' or 'uniform' (got "
-                f"{self.shortcut_time_distribution!r})."
-            )
-
         # Consistency targets land on the half-step grid of the finest level, so every
         # visited time must map to an exact timestep bucket. Off-grid rounding would
         # quietly train the teacher at a slightly different noise level than the
