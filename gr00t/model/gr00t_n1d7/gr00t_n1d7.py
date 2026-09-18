@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 from typing import Any, Tuple
 
@@ -46,19 +47,34 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
+        # Not part of diffusion_model_cfg: that dict is loaded verbatim from a
+        # checkpoint's config.json and would not carry a newly added key.
+        self.shortcut_enabled = config.shortcut_enabled
         if config.use_alternate_vl_dit:
             self.model = AlternateVLDiT(
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
                 attend_text_every_n_blocks=config.attend_text_every_n_blocks,
+                use_shortcut_dt_embed=config.shortcut_enabled,
             )
             logger.info("Using AlternateVLDiT for diffusion model")
         else:
             self.model = DiT(
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
+                use_shortcut_dt_embed=config.shortcut_enabled,
             )
             logger.info("Using DiT for diffusion model")
+        if config.shortcut_enabled:
+            logger.info(
+                "Shortcut objective enabled: %d levels (%s steps), weight %.3g, "
+                "consistency on %.0f%% of each batch, t ~ %s",
+                config.shortcut_num_levels,
+                "/".join(str(2**i) for i in range(config.shortcut_num_levels)),
+                config.shortcut_loss_weight,
+                100 * config.shortcut_consistency_frac,
+                config.shortcut_time_distribution,
+            )
         self.action_dim = config.max_action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -191,6 +207,116 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    @contextlib.contextmanager
+    def _teacher_eval(self):
+        """Run the bootstrap teacher with dropout disabled.
+
+        The production diffusion_model_cfg sets dropout=0.2 and final_dropout=True,
+        and forward() runs under model.train(). Two teacher half-steps drawn under
+        independent dropout masks do not compose into a valid two-step trajectory, so
+        every bootstrap target would be corrupted -- silently, because the loss stays
+        finite and still decreases.
+
+        Mirrors set_frozen_modules_to_eval_mode(), which exists for the same reason.
+        """
+        modules = [self.action_encoder, self.model, self.action_decoder]
+        if self.config.add_pos_embed:
+            modules.append(self.position_embedding)
+        was_training = [m.training for m in modules]
+        try:
+            for module in modules:
+                module.eval()
+            yield
+        finally:
+            for module, flag in zip(modules, was_training):
+                module.train(flag)
+
+    def _time_to_bucket(self, t: torch.Tensor) -> torch.Tensor:
+        return (t * self.num_timestep_buckets).long()
+
+    def _shortcut_consistency_loss(
+        self,
+        actions: torch.Tensor,
+        noise: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        state_features: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        backbone_output: BatchFeature,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Self-consistency: one step of size d must equal two steps of size d/2.
+
+        The target is built by the model itself one level finer, under stop-grad. The
+        chain bootstraps downward: the flow-matching term trains the finest level
+        directly, level num_levels-2 learns from it, and so on to level 0 (one step).
+
+        No EMA teacher. Training here is supervised finetuning on a fixed dataset for
+        a few thousand steps, not the off-policy RL setting an EMA target is there to
+        stabilise; and under ZeRO-2 (which replicates parameters) an EMA copy would be
+        a full second replica per rank that also lands in every checkpoint.
+        """
+        batch_size = actions.shape[0]
+        n = max(1, int(round(batch_size * self.config.shortcut_consistency_frac)))
+        rows = slice(0, n)  # the sampler already shuffles, so a prefix is a random subset
+        device = actions.device
+        dtype = actions.dtype
+
+        # Levels 0 .. num_levels-2; each bootstraps from the level one finer.
+        levels = torch.randint(0, self.config.shortcut_num_levels - 1, (n,), device=device)
+        num_steps = torch.pow(2, levels).to(dtype)  # steps at this level
+        step_size = 1.0 / num_steps
+
+        # Start on this level's own grid: consistency only has to hold where the
+        # sampler actually lands, and an on-grid t keeps every timestep bucket exact.
+        k = (torch.rand(n, device=device, dtype=dtype) * num_steps).floor()
+        k = torch.minimum(k, num_steps - 1)  # guard the rand()==1.0 corner
+        t = k / num_steps
+
+        t_b = t[:, None, None]
+        x_t = (1 - t_b) * noise[rows] + t_b * actions[rows]
+
+        sub_backbone = BatchFeature(
+            data={
+                key: (value[rows] if torch.is_tensor(value) else value)
+                for key, value in backbone_output.items()
+            }
+        )
+        shared = dict(
+            embodiment_id=embodiment_id[rows],
+            state_features=state_features[rows],
+            vl_embeds=vl_embeds[rows],
+            backbone_output=sub_backbone,
+        )
+
+        half = step_size / 2
+        teacher_levels = levels + 1
+        with self._teacher_eval(), torch.no_grad():
+            v1 = self._denoise_step(
+                actions=x_t,
+                timesteps_tensor=self._time_to_bucket(t),
+                dt_level=teacher_levels,
+                **shared,
+            )
+            x_mid = x_t + half[:, None, None] * v1
+            v2 = self._denoise_step(
+                actions=x_mid,
+                timesteps_tensor=self._time_to_bucket(t + half),
+                dt_level=teacher_levels,
+                **shared,
+            )
+            target = (v1 + v2) / 2
+
+        pred = self._denoise_step(
+            actions=x_t,
+            timesteps_tensor=self._time_to_bucket(t),
+            dt_level=levels,
+            **shared,
+        )
+
+        mask = action_mask[rows]
+        loss = F.mse_loss(pred, target, reduction="none") * mask
+        return loss.sum() / (mask.sum() + 1e-6)
+
     def _denoise_step(
         self,
         actions: torch.Tensor,
@@ -200,6 +326,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         vl_embeds: torch.Tensor,
         backbone_output: BatchFeature,
         encoder_attention_mask: torch.Tensor | None = None,
+        dt_level: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict the flow-matching velocity for a single denoising step.
 
@@ -236,6 +363,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 timestep=timesteps_tensor,
                 image_mask=backbone_output.image_mask,
                 backbone_attention_mask=backbone_output.backbone_attention_mask,
+                dt_level=dt_level,
             )
         else:
             model_output = self.model(
@@ -243,6 +371,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=encoder_attention_mask,
                 timestep=timesteps_tensor,
+                dt_level=dt_level,
             )
 
         pred = self.action_decoder(model_output, embodiment_id)
@@ -304,7 +433,19 @@ class Gr00tN1d7ActionHead(nn.Module):
         velocity = actions - noise
 
         # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        t_discretized = self._time_to_bucket(t[:, 0, 0])
+
+        # The flow-matching term is the infinitesimal-step limit, so it defines the
+        # finest level. Kept on the FULL batch: it is what protects the 4-step
+        # behaviour we must not regress, and diluting it would work against that.
+        fm_dt_level = None
+        if self.shortcut_enabled:
+            fm_dt_level = torch.full(
+                (actions.shape[0],),
+                self.config.shortcut_num_levels - 1,
+                device=actions.device,
+                dtype=torch.long,
+            )
 
         # NOTE: the previous code passed return_all_hidden_states=True here and then
         # discarded the second return value, so dropping it is a no-op.
@@ -316,20 +457,41 @@ class Gr00tN1d7ActionHead(nn.Module):
             vl_embeds=vl_embeds,
             backbone_output=backbone_output,
             encoder_attention_mask=backbone_output.backbone_attention_mask,
+            dt_level=fm_dt_level,
         )
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        flow_loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        loss = flow_loss
 
-        return {
+        consistency_loss = None
+        if self.shortcut_enabled:
+            consistency_loss = self._shortcut_consistency_loss(
+                actions=actions,
+                noise=noise,
+                embodiment_id=embodiment_id,
+                state_features=state_features,
+                vl_embeds=vl_embeds,
+                backbone_output=backbone_output,
+                action_mask=action_mask,
+            )
+            loss = loss + self.config.shortcut_loss_weight * consistency_loss
+
+        output = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+        if self.shortcut_enabled:
+            # Reported separately so the two terms can be watched apart: a consistency
+            # loss that starts near zero means the model is ignoring dt_level.
+            output["flow_loss"] = flow_loss.detach()
+            output["consistency_loss"] = consistency_loss.detach()
+        return output
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
