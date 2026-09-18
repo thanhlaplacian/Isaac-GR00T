@@ -63,6 +63,29 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
+    # --- Shortcut Objective (one-step action generation) ---
+    shortcut_enabled: bool = False
+    """
+    If True, train with the shortcut self-consistency objective alongside flow
+    matching, producing a model that can also sample in 1 or 2 steps instead of 4.
+    Adds one zero-initialised embedding to the denoiser, so the run starts from
+    exactly the pretrained flow model.
+    """
+
+    shortcut_num_levels: int = 3
+    """Number of step-size levels; level L means 2**L Euler steps. Default 3 covers 1, 2 and 4."""
+
+    shortcut_loss_weight: float = 1.0
+    """Weight of the self-consistency term relative to the flow-matching term."""
+
+    shortcut_consistency_frac: float = 0.5
+    """Fraction of each batch that also gets a self-consistency target. Costs two extra
+    denoiser forwards per selected row; ~+30% training FLOPs at the default."""
+
+    shortcut_time_distribution: str = "beta"
+    """Noise-level distribution for the flow-matching term: "beta" (GR00T's own) or
+    "uniform" (the shortcut paper's). Applies with or without shortcut_enabled."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""

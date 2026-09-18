@@ -75,6 +75,33 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         self.train_dataset, self.eval_dataset = self._create_dataset(self.save_cfg_dir)
         self.data_collator = self._create_collator()
 
+    @staticmethod
+    def _init_missing_shortcut_weights(model, missing_keys: list[str]) -> None:
+        """Re-zero the shortcut dt branch after loading a checkpoint that lacks it.
+
+        Starting a shortcut finetune from an ordinary checkpoint is the normal case, so
+        dt_encoder.* is legitimately missing. HuggingFace initialises missing keys
+        randomly, which would make the very first step differ from the pretrained flow
+        model -- and a failed shortcut run would then be indistinguishable from a badly
+        initialised one. Re-running the zero-init restores that guarantee; the assert
+        is there because this repo also builds models on meta devices, where an
+        __init__-time zero can be overwritten later.
+        """
+        dit = getattr(model.action_head, "model", None)
+        if dit is None or getattr(dit, "dt_encoder", None) is None:
+            return
+        if not any("dt_encoder" in key for key in missing_keys):
+            return
+
+        dit.zero_init_dt_embed()
+        linear_2 = dit.dt_encoder.timestep_embedder.linear_2
+        if linear_2.weight.abs().max().item() != 0 or linear_2.bias.abs().max().item() != 0:
+            raise RuntimeError(
+                "dt_encoder output projection is not zero after zero_init_dt_embed(); "
+                "the shortcut run would not start from the pretrained flow model."
+            )
+        logging.info("dt_encoder not in checkpoint - zero-initialized (shortcut branch)")
+
     def _create_model(self):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
@@ -87,6 +114,15 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
+                # This kwarg list is an allowlist: a config field that is not named
+                # here is silently dropped, and training proceeds with the
+                # checkpoint's value. Omitting these would run plain flow matching
+                # while every log line claimed the shortcut objective was on.
+                shortcut_enabled=self.config.model.shortcut_enabled,
+                shortcut_num_levels=self.config.model.shortcut_num_levels,
+                shortcut_loss_weight=self.config.model.shortcut_loss_weight,
+                shortcut_consistency_frac=self.config.model.shortcut_consistency_frac,
+                shortcut_time_distribution=self.config.model.shortcut_time_distribution,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
@@ -95,6 +131,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             )
 
             missing_keys = loading_info.get("missing_keys", [])
+            self._init_missing_shortcut_weights(model, missing_keys)
             mask_token_missing = any("mask_token" in key for key in missing_keys)
             if mask_token_missing and model.action_head.mask_token is not None:
                 with torch.no_grad():
@@ -105,7 +142,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            other_missing = [
+                k for k in missing_keys if "mask_token" not in k and "dt_encoder" not in k
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
