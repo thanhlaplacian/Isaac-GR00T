@@ -1286,6 +1286,35 @@ def export_action_decoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
 # ============================================================
 
 
+def _reject_shortcut_checkpoint(policy) -> None:
+    """Refuse to export a shortcut model until the exporter can carry dt_level.
+
+    A shortcut model is conditioned on the step size it is about to take. The ONNX
+    graph below pins the DiT's inputs to (sa_embs, vl_embs, timestep) plus the two
+    masks, and trt_model_forward.py binds the same fixed set, so dt_level would
+    simply never reach the exported denoiser: it would fall back to None, the step
+    conditioning would be dropped, and the engine would produce a degraded
+    trajectory -- worst at 1 step, exactly where the model is supposed to shine.
+
+    That failure is silent. Exporting is expensive and engines get shipped, so this
+    stops at the door instead of leaving a quiet quality regression in a binary
+    artifact. Supporting dt_level here is a separate piece of work: it needs a new
+    graph input, new dynamic axes, and a matching binding in trt_model_forward.py.
+    """
+    action_head = getattr(policy.model, "action_head", None)
+    dit = getattr(action_head, "model", None)
+    if dit is None or getattr(dit, "dt_encoder", None) is None:
+        return
+    raise NotImplementedError(
+        "This checkpoint was trained with the shortcut objective (the DiT carries a "
+        "dt_encoder), and the ONNX/TensorRT path cannot yet pass dt_level to the "
+        "denoiser. Exporting it would silently drop the step-size conditioning and "
+        "produce a worse engine, especially at 1 and 2 steps. Export a "
+        "flow-matching checkpoint, or add dt_level to this exporter and to "
+        "scripts/deployment/trt_model_forward.py first."
+    )
+
+
 def main(args):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     logger.info("=" * 80)
@@ -1307,6 +1336,7 @@ def main(args):
         device="cuda",
     )
     logger.info("  Policy loaded")
+    _reject_shortcut_checkpoint(policy)
 
     # Step 2: Load dataset
     logger.info("\n[Step 2] Loading dataset...")
