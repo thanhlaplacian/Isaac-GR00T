@@ -722,6 +722,31 @@ class Gr00tN1d7(PreTrainedModel):
     config_class = Gr00tN1d7Config
     supports_gradient_checkpointing = True
 
+    def _init_weights(self, module):
+        """Keep the shortcut dt branch at zero even when HuggingFace re-initialises it.
+
+        Starting a shortcut run from an ordinary checkpoint leaves dt_encoder.* missing,
+        and from_pretrained then initialises missing keys with a normal distribution --
+        wiping the zero set in DiT.__init__. Measured on the real 3B checkpoint before
+        this override: |w|max = 0.066, and sampling drifted by up to 6e-2 at 4 steps.
+        The model would no longer start from the pretrained flow policy, so a failed
+        shortcut experiment could not be told apart from a bad initialisation.
+
+        This is the hook HuggingFace calls for exactly the modules it had to
+        initialise itself: anything restored from the checkpoint is marked
+        _is_hf_initialized and never reaches here, so a *trained* dt branch is left
+        alone. Doing it here rather than at the call site covers every load path --
+        Gr00tPolicy and the eval server included, not just the finetune pipeline.
+        """
+        super()._init_weights(module)
+
+        dit = getattr(getattr(self, "action_head", None), "model", None)
+        dt_encoder = getattr(dit, "dt_encoder", None)
+        if dt_encoder is not None and module is dt_encoder.timestep_embedder.linear_2:
+            module.weight.data.zero_()
+            if module.bias is not None:
+                module.bias.data.zero_()
+
     def __init__(
         self,
         config: Gr00tN1d7Config,
