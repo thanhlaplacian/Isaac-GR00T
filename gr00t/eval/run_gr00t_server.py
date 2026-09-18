@@ -64,6 +64,14 @@ class ServerConfig:
     device: str = "cuda"
     """Device to run the model on"""
 
+    denoising_steps: int | None = None
+    """Number of flow-matching denoising steps at inference.
+
+    Defaults to the value baked into the checkpoint's config.json (4 for GR00T N1.7).
+    ``open_loop_eval.py`` directs users here when evaluating against a remote server,
+    so this is the only place a closed-loop run can change the step budget.
+    """
+
     # Replay policy configs
     dataset_path: str | None = None
     """Path to the dataset for replay trajectory"""
@@ -108,6 +116,24 @@ def main(config: ServerConfig):
             device=config.device,
             strict=config.strict,
         )
+        # The action head reads num_inference_timesteps at sampling time, so
+        # overriding it here is enough -- same mechanism as open_loop_eval.py.
+        action_head = getattr(policy.model, "action_head", None)
+        if config.denoising_steps is not None:
+            if config.denoising_steps <= 0:
+                raise ValueError(
+                    f"--denoising-steps must be positive; got {config.denoising_steps}."
+                )
+            if action_head is None:
+                raise ValueError(
+                    "--denoising-steps was set, but this model has no action head to "
+                    "apply it to; the run would have silently used the checkpoint value."
+                )
+            action_head.num_inference_timesteps = config.denoising_steps
+        # Printed unconditionally: a run that silently used the wrong step count is
+        # indistinguishable from one that used the right one in the result files.
+        if action_head is not None:
+            print(f"  Denoising steps: {action_head.num_inference_timesteps}")
     elif config.dataset_path is not None:
         if config.execution_horizon is None:
             raise ValueError(
