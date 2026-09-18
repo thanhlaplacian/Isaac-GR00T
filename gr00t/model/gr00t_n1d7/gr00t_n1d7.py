@@ -179,6 +179,64 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    def _denoise_step(
+        self,
+        actions: torch.Tensor,
+        timesteps_tensor: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        state_features: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        backbone_output: BatchFeature,
+        encoder_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict the flow-matching velocity for a single denoising step.
+
+        Shared by training (``forward``) and sampling (``get_action_with_features``)
+        so the two cannot drift apart.
+
+        ``encoder_attention_mask`` is threaded through only to keep both call sites
+        passing exactly what they passed before this refactor. Neither DiT nor
+        AlternateVLDiT actually reads it: both hardcode ``encoder_attention_mask=None``
+        on every block, and AlternateVLDiT builds its own cross-attention masks from
+        ``image_mask & backbone_attention_mask``.
+
+        Returns:
+            Predicted velocity over the action horizon, [B, action_horizon, action_dim].
+        """
+        action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+
+        # Maybe add position embedding.
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(
+                action_features.shape[1], dtype=torch.long, device=action_features.device
+            )
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+
+        # Join state and action embeddings along the sequence dimension.
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+
+        if self.config.use_alternate_vl_dit:
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=timesteps_tensor,
+                image_mask=backbone_output.image_mask,
+                backbone_attention_mask=backbone_output.backbone_attention_mask,
+            )
+        else:
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=timesteps_tensor,
+            )
+
+        pred = self.action_decoder(model_output, embodiment_id)
+        # Slice off the leading state token; equals action_horizon at both call sites.
+        return pred[:, -action_features.shape[1] :]
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
         Forward pass through the action head.
@@ -204,7 +262,6 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embeds = backbone_output.backbone_features
-        device = vl_embeds.device
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
@@ -236,41 +293,18 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
 
-        # Maybe add position embedding.
-        if self.config.add_pos_embed:
-            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            action_features = action_features + pos_embs
-
-        # Join vision, language, state and action embedding along sequence dimension.
-        sa_embs = torch.cat((state_features, action_features), dim=1)
-        vl_attn_mask = backbone_output.backbone_attention_mask
-
-        if self.config.use_alternate_vl_dit:
-            image_mask = backbone_output.image_mask
-            backbone_attention_mask = backbone_output.backbone_attention_mask
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-                image_mask=image_mask,
-                backbone_attention_mask=backbone_attention_mask,
-            )
-        else:
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-            )
-
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
+        # NOTE: the previous code passed return_all_hidden_states=True here and then
+        # discarded the second return value, so dropping it is a no-op.
+        pred_actions = self._denoise_step(
+            actions=noisy_trajectory,
+            timesteps_tensor=t_discretized,
+            embodiment_id=embodiment_id,
+            state_features=state_features,
+            vl_embeds=vl_embeds,
+            backbone_output=backbone_output,
+            encoder_attention_mask=backbone_output.backbone_attention_mask,
+        )
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
@@ -402,34 +436,14 @@ class Gr00tN1d7ActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
-
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
-
-            # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
-                )
-            else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
+            pred_velocity = self._denoise_step(
+                actions=actions,
+                timesteps_tensor=timesteps_tensor,
+                embodiment_id=embodiment_id,
+                state_features=state_features,
+                vl_embeds=vl_embeds,
+                backbone_output=backbone_output,
+            )
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
