@@ -243,6 +243,7 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        use_shortcut_dt_embed: bool = False,
     ):
         super().__init__()
 
@@ -284,10 +285,56 @@ class DiT(ModelMixin, ConfigMixin):
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
         self.proj_out_2 = nn.Linear(self.inner_dim, self.output_dim)
+
+        # Shortcut-model step-size conditioning. Off by default; when on it adds a
+        # second embedding onto the same `temb` that drives every AdaLayerNorm and
+        # the output head -- the only conditioning path in this model.
+        #
+        # Built LAST on purpose: every other submodule has already drawn from the RNG
+        # by this point, so flipping this flag leaves their initialisation untouched.
+        # A model built with the flag on is then identical to one built with it off,
+        # not merely similar, which is what makes the identity check meaningful.
+        self.dt_encoder = None
+        if use_shortcut_dt_embed:
+            self.dt_encoder = TimestepEncoder(
+                embedding_dim=self.inner_dim, compute_dtype=self.compute_dtype
+            )
+            self.zero_init_dt_embed()
+
         print(
             "Total number of DiT parameters: ",
             sum(p.numel() for p in self.parameters() if p.requires_grad),
         )
+
+    def zero_init_dt_embed(self) -> None:
+        """Zero the dt branch's output projection so it contributes exactly nothing.
+
+        With ``linear_2`` zeroed, ``dt_encoder(dt_level)`` returns zeros, ``temb`` is
+        unchanged, and a model built with ``use_shortcut_dt_embed=True`` reproduces the
+        pretrained flow model bit for bit -- while still receiving gradients from the
+        first optimizer step. Any shortcut result is otherwise indistinguishable from a
+        badly initialised branch.
+
+        Public because loading must re-run it: HuggingFace randomly re-initialises keys
+        missing from a checkpoint, which would silently perturb a finetune started from
+        an existing (non-shortcut) checkpoint.
+        """
+        if self.dt_encoder is None:
+            return
+        with torch.no_grad():
+            self.dt_encoder.timestep_embedder.linear_2.weight.zero_()
+            self.dt_encoder.timestep_embedder.linear_2.bias.zero_()
+
+    def _conditioning(
+        self,
+        timestep: Optional[torch.LongTensor],
+        dt_level: Optional[torch.LongTensor],
+    ) -> torch.Tensor:
+        """Build the adaLN conditioning vector from the noise level and step size."""
+        temb = self.timestep_encoder(timestep)
+        if self.dt_encoder is not None and dt_level is not None:
+            temb = temb + self.dt_encoder(dt_level)
+        return temb
 
     def forward(
         self,
@@ -296,9 +343,10 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        dt_level: Optional[torch.LongTensor] = None,
     ):
         # Encode timesteps
-        temb = self.timestep_encoder(timestep)
+        temb = self._conditioning(timestep, dt_level)
 
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
@@ -355,11 +403,12 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        dt_level: Optional[torch.LongTensor] = None,
     ):
         assert image_mask is not None, "Image mask is required"
 
         # Encode timesteps
-        temb = self.timestep_encoder(timestep)
+        temb = self._conditioning(timestep, dt_level)
 
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
