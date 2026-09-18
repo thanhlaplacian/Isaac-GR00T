@@ -143,6 +143,82 @@ gr00t/eval/sim/LIBERO/libero_uv/.venv/bin/python gr00t/eval/rollout_policy.py \
     --n-envs 5
 ```
 
+# One-step action generation (shortcut objective)
+
+GR00T N1.7 builds an action chunk by integrating a flow-matching velocity field over
+4 Euler steps, each a full DiT forward. The shortcut objective
+([Frans et al.](https://arxiv.org/abs/2410.12557)) additionally conditions the
+denoiser on the **step size**, and adds a self-consistency term forcing one step of
+size `d` to equal two steps of `d/2`. One set of weights then samples at 1, 2 or 4
+steps.
+
+It is off by default. Turning it on changes nothing about how you finetune apart
+from one flag.
+
+## Finetune
+
+```bash
+NUM_GPUS=8 MAX_STEPS=20000 GLOBAL_BATCH_SIZE=640 SAVE_STEPS=1000 uv run bash examples/finetune.sh \
+    --base-model-path nvidia/GR00T-N1.7-3B \
+    --dataset-path examples/LIBERO/libero_10_no_noops_1.0.0_lerobot/ \
+    --embodiment-tag LIBERO_PANDA \
+    --output-dir /tmp/libero_10_shortcut \
+    --state-dropout-prob 0.2 \
+    -- --shortcut-enabled
+```
+
+Everything after `--` is forwarded to `launch_finetune.py`. The knobs:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--shortcut-enabled` | off | Adds the self-consistency term and a zero-initialised step-size embedding |
+| `--shortcut-num-levels` | `3` | Step budgets `2**0 .. 2**(n-1)`, so 3 covers 1/2/4 |
+| `--shortcut-loss-weight` | `1.0` | Weight of the consistency term against the flow term |
+| `--shortcut-consistency-frac` | `0.5` | Share of each batch that also gets a consistency target |
+| `--shortcut-time-distribution` | `beta` | `beta` = GR00T's schedule, `uniform` = the paper's |
+
+The run starts from *exactly* the pretrained flow model: the step-size embedding's
+output projection is zero-initialised, so it contributes nothing at step 0 while
+still receiving gradients. Extra cost is one embedding (2,755,584 parameters, 0.17%
+of the action head) and roughly +30% training FLOPs at the default `--shortcut-consistency-frac 0.5`.
+
+W&B gets `flow_loss` and `consistency_loss` separately. **A `consistency_loss` that
+starts near zero means the model is ignoring the step-size conditioning** -- that is
+the failure mode to watch for, not a healthy total loss.
+
+## Evaluate at 1, 2 and 4 steps
+
+`--denoising-steps` on the server sets the budget; without it the checkpoint's own
+value (4) is used. The server prints the effective count in its banner.
+
+**Terminal 1 - Server (1-step):**
+```bash
+uv run python gr00t/eval/run_gr00t_server.py \
+    --model-path /tmp/libero_10_shortcut/checkpoint-20000 \
+    --embodiment-tag LIBERO_PANDA \
+    --denoising-steps 1 \
+    --use-sim-policy-wrapper
+```
+
+**Terminal 2 - Client:** unchanged from the section above.
+
+The same checkpoint at 1, 2 and 4 steps is its own control: one training run, three
+evaluations, no confound from different weights. Compare against the released
+4-step model with the same seed and episode count.
+
+For a quick check without a simulator, `gr00t/eval/open_loop_eval.py --denoising-steps {1,2,4}`
+reports action MSE against ground truth in minutes. Use it to catch a run that is
+not learning the step-size conditioning long before spending a full finetune on it.
+
+## Restrictions
+
+- Step counts must be powers of two, and within `--shortcut-num-levels`. Anything
+  else raises rather than silently sampling at an untrained step size.
+- ONNX/TensorRT export refuses shortcut checkpoints: the exported graph cannot carry
+  the step-size input yet, and would quietly drop the conditioning. Use a
+  flow-matching checkpoint for deployment, or extend
+  `scripts/deployment/export_onnx_n1d7.py` and `trt_model_forward.py` first.
+
 # Full task list
 
 ## Libero 10 (Long)
