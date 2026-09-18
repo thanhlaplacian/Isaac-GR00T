@@ -109,6 +109,35 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # Shortcut model parameters (Frans et al., One Step Diffusion via Shortcut Models).
+    # All default-off: with shortcut_enabled=False the model trains and samples exactly
+    # as plain flow matching, and every field below is ignored.
+    shortcut_enabled: bool = False
+    """Train with the shortcut self-consistency objective alongside flow matching."""
+
+    shortcut_num_levels: int = 3
+    """Number of step-size levels. Level L means 2**L Euler steps, so the default 3
+    covers inference at 1, 2 and 4 steps. The finest level (num_levels - 1) is the one
+    the flow-matching loss trains; the coarser levels are trained by self-consistency,
+    each bootstrapping from the level one finer."""
+
+    shortcut_loss_weight: float = 1.0
+    """Weight of the self-consistency term relative to the flow-matching term."""
+
+    shortcut_consistency_frac: float = 0.5
+    """Fraction of each batch that also gets a self-consistency target. The
+    flow-matching loss is always computed on the whole batch, so this trades training
+    FLOPs (two extra denoiser forwards per selected row) against how fast the coarse
+    levels learn. 0.25 is close to the reference implementation's batch split; 1.0
+    matches SORL."""
+
+    shortcut_time_distribution: str = "beta"
+    """Noise-level distribution for the flow-matching term: "beta" keeps GR00T's
+    Beta(noise_beta_alpha, noise_beta_beta) sampler, "uniform" uses the shortcut
+    paper's U[0, 1). The self-consistency term always samples on its level's grid
+    regardless of this setting, since consistency only has to hold where the sampler
+    actually lands."""
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True
@@ -136,6 +165,51 @@ class Gr00tN1d7Config(PretrainedConfig):
                     setattr(self, f.name, f.default)
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
+
+        self._validate_shortcut_config()
+
+    def _validate_shortcut_config(self) -> None:
+        """Reject shortcut settings that would fail silently rather than loudly.
+
+        Only runs when the objective is enabled, so checkpoints predating these fields
+        keep loading unchanged.
+        """
+        if not getattr(self, "shortcut_enabled", False):
+            return
+
+        if self.shortcut_num_levels < 2:
+            raise ValueError(
+                f"shortcut_num_levels must be >= 2 (got {self.shortcut_num_levels}): "
+                "self-consistency needs at least one coarse level to bootstrap from a "
+                "finer one."
+            )
+        if not 0.0 < self.shortcut_consistency_frac <= 1.0:
+            raise ValueError(
+                f"shortcut_consistency_frac must be in (0, 1] (got "
+                f"{self.shortcut_consistency_frac}); 0 would enable the objective while "
+                "training nothing with it."
+            )
+        if self.shortcut_loss_weight < 0:
+            raise ValueError(
+                f"shortcut_loss_weight must be >= 0 (got {self.shortcut_loss_weight})."
+            )
+        if self.shortcut_time_distribution not in ("beta", "uniform"):
+            raise ValueError(
+                f"shortcut_time_distribution must be 'beta' or 'uniform' (got "
+                f"{self.shortcut_time_distribution!r})."
+            )
+
+        # Consistency targets land on the half-step grid of the finest level, so every
+        # visited time must map to an exact timestep bucket. Off-grid rounding would
+        # quietly train the teacher at a slightly different noise level than the
+        # student, and nothing downstream would report it.
+        finest = 2 ** (self.shortcut_num_levels - 1)
+        if self.num_timestep_buckets % finest != 0:
+            raise ValueError(
+                f"num_timestep_buckets ({self.num_timestep_buckets}) must be divisible "
+                f"by 2**(shortcut_num_levels - 1) = {finest}, otherwise the denoising "
+                "grid does not land on exact buckets."
+            )
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""
