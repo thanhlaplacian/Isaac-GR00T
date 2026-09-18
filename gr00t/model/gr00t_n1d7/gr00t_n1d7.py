@@ -15,6 +15,7 @@
 
 import contextlib
 import logging
+import math
 from typing import Any, Tuple
 
 import torch
@@ -530,6 +531,34 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         return BatchFeature(data={"backbone_features": vl_embeds, "state_features": state_features})
 
+    def _inference_dt_level(self, batch_size: int, device) -> torch.Tensor | None:
+        """Step-size level for the current inference budget, or None when disabled.
+
+        A shortcut model is conditioned on how large a step it is about to take, so
+        sampling at N steps must announce level log2(N) -- the same level the
+        objective trained for that budget. Getting this wrong does not raise; it just
+        produces a worse trajectory, so the unsupported cases are rejected here rather
+        than left to show up as a mediocre success rate.
+        """
+        if not self.shortcut_enabled:
+            return None
+
+        num_steps = self.num_inference_timesteps
+        level = int(round(math.log2(num_steps))) if num_steps > 0 else -1
+        if num_steps <= 0 or 2**level != num_steps:
+            raise ValueError(
+                f"num_inference_timesteps must be a power of two for a shortcut model "
+                f"(got {num_steps}); the objective only trains step sizes 2**-level."
+            )
+        if level >= self.config.shortcut_num_levels:
+            trained = "/".join(str(2**i) for i in range(self.config.shortcut_num_levels))
+            raise ValueError(
+                f"num_inference_timesteps={num_steps} needs level {level}, but this "
+                f"model was trained with shortcut_num_levels="
+                f"{self.config.shortcut_num_levels} (step budgets {trained})."
+            )
+        return torch.full((batch_size,), level, device=device, dtype=torch.long)
+
     @torch.no_grad()
     def get_action_with_features(
         self,
@@ -561,6 +590,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         )
 
         dt = 1.0 / self.num_inference_timesteps
+        dt_level = self._inference_dt_level(batch_size, device)
         vel_strength = torch.ones_like(actions)
 
         if "action" in action_input:
@@ -617,6 +647,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 state_features=state_features,
                 vl_embeds=vl_embeds,
                 backbone_output=backbone_output,
+                dt_level=dt_level,
             )
 
             # Update actions using euler integration.
