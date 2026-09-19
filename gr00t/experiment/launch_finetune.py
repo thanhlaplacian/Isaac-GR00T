@@ -106,6 +106,9 @@ if __name__ == "__main__":
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
+    # experiment.py already hands this to TrainingArguments(seed=...), so one field
+    # drives both the torch/HF seed and the dataset's shard schedule.
+    config.data.seed = ft_config.seed
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"

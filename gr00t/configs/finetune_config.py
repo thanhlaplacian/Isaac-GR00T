@@ -63,6 +63,18 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
+    seed: int = 42
+    """
+    Random seed. Drives both the torch/HuggingFace seed and the data pipeline's shard
+    schedule, since experiment.py passes this same value to TrainingArguments. 42 is the
+    existing default, so leaving it alone changes nothing.
+
+    Vary it to produce a genuine replicate of a run. Without that, two runs of one
+    configuration differ only by CUDA nondeterminism -- far too small to estimate
+    run-to-run variance from, and that variance has to be known before a difference
+    between two configurations means anything.
+    """
+
     # --- Shortcut Objective (one-step action generation) ---
     shortcut_enabled: bool = False
     """
