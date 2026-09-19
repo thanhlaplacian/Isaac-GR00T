@@ -284,6 +284,32 @@ class Gr00tTrainer(Trainer):
         self.loss = loss
 
         # --------------------------------------------------------------
+        # Shortcut objective: surface its two terms
+        # --------------------------------------------------------------
+        # The action head returns flow_loss and consistency_loss alongside the total,
+        # but HF only ever logs the scalar it optimises, so both were invisible during
+        # a run. That matters because the objective's main failure mode is silent: a
+        # consistency term pinned near zero means the model is ignoring dt_level, and
+        # the total loss looks perfectly healthy while it happens.
+        #
+        # Subtracting a control run's loss curve is not a substitute -- after step 0 the
+        # two models differ, so the difference carries a flow-loss gap as well.
+        if (
+            model.training
+            and self.state.global_step % self.args.logging_steps == 0
+            and isinstance(outputs, dict)
+            and "consistency_loss" in outputs
+            and "flow_loss" in outputs
+        ):
+            terms = torch.tensor(
+                [[float(outputs["flow_loss"]), float(outputs["consistency_loss"])]],
+                device=loss.device,
+            )
+            flow_mean, consistency_mean = self._nested_gather(terms).mean(dim=0).tolist()
+            if self.args.local_rank in (-1, 0):
+                self.log({"flow_loss": flow_mean, "consistency_loss": consistency_mean})
+
+        # --------------------------------------------------------------
         # Accuracy calculation
         # --------------------------------------------------------------
         if (
